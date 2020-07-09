@@ -78,7 +78,7 @@ func clientProcess() {
 			}
 		}
 
-		if isError(line) {
+		if isError(lineByte) {
 			errorBucket[pos] = append(errorBucket[pos], traceId)
 		}
 
@@ -121,57 +121,27 @@ func getUrl() string {
 	return ""
 }
 
-func isError(line string) bool {
-	tagLength := 0
-	tagEndIndex := len(line)
-	for i := tagEndIndex - 1; i >= 0; i-- {
-		if line[i] == tagSplit || line[i] == split {
+func isError(line []byte) bool {
+	searchStart := 100
+	searchEnd := len(line) - 1
+	for {
+		pos := bytes.IndexByte(line[searchStart:searchEnd], '=')
+		if pos < 0 {
+			return false
+		}
+		searchStart += pos
+		if line[searchStart-2] == 'd' && line[searchStart-1] == 'e' {
+			return line[searchStart+1] != '2'
+		}
+		if line[searchStart-2] == 'o' && line[searchStart-1] == 'r' {
+			return true
+		}
 
-			if tagLength == error1Length {
-				startIndex := i + 1
-				j := startIndex
-				for ; j < tagEndIndex; j++ {
-					if line[j] != error1[j-startIndex] {
-						break
-					}
-				}
-				if j == tagEndIndex {
-					return true
-				}
-			}
-
-			if tagLength == httpStatusCodeOKLength {
-				startIndex := i + 1
-				j := startIndex
-				for ; j < tagEndIndex; j++ {
-					k := j - startIndex
-					if k < error2Length {
-						if line[j] != httpStatusCodeOk[k] {
-							break
-						}
-					} else {
-						if line[j] != httpStatusCodeOk[k] {
-							return true
-						}
-					}
-				}
-				if j == tagEndIndex {
-					return false
-				}
-			}
-
-			tagLength = 0
-			tagEndIndex = i
-
-			if line[i] == split {
-				break
-			}
-		} else {
-			tagLength++
+		searchStart += 4
+		if searchStart > searchEnd {
+			return false
 		}
 	}
-
-	return false
 }
 
 func getWrongTracing(data *getWrongTraceStruct) map[string][]string {
