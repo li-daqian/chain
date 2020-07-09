@@ -1,20 +1,47 @@
 package main
 
 import (
-	"fmt"
+	"bytes"
 	"log"
+	"net/http"
 	"testing"
-	"time"
 )
 
 func TestRead(t *testing.T) {
-	clientInit()
+	pageLength := 1024*1024*4
+	buffer := make([]byte, pageLength)
 
-	start := time.Now()
-	clientProcess()
-	elapsed := time.Since(start)
+	tailLength := 0
 
-	fmt.Printf("Cost %s \n", elapsed)
+	url := "http://localhost/trace1.data"
+	resp, _ := http.Get(url)
+	count := 0
+	for {
+		read, _ := resp.Body.Read(buffer[tailLength:pageLength-tailLength])
+		if read == 0 {
+			break
+		}
+		endIndex := read + tailLength
+
+		startIndex := 0
+		for {
+			lineIndex := bytes.IndexByte(buffer[startIndex:endIndex], '\n')
+			if lineIndex < 0 {
+				tailLength = endIndex - startIndex
+				copy(buffer[:tailLength], buffer[startIndex:endIndex])
+				break
+			}
+
+			count++
+			isError(buffer[startIndex : startIndex+lineIndex])
+
+			startIndex += lineIndex + 1
+			if startIndex > endIndex {
+				tailLength = 0
+				break
+			}
+		}
+	}
 }
 
 func Test(t *testing.T) {

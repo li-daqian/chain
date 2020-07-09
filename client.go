@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"bytes"
 	"encoding/json"
 	"io/ioutil"
@@ -27,6 +26,9 @@ var (
 	error2Length           = len(error2)
 	httpStatusCodeOk       = "http.status_code=200"
 	httpStatusCodeOKLength = len(httpStatusCodeOk)
+
+	pageLength = 1024*1024*4
+	buffer = make([]byte, pageLength)
 )
 
 func clientInit() {
@@ -58,47 +60,64 @@ func clientProcess() {
 
 	count := 0
 	pos := 0
-	reader := bufio.NewReaderSize(resp.Body, 1024 * 512)
+	tailLength := 0
 	for {
-		lineByte, err := reader.ReadBytes('\n')
-		if err != nil {
+		read, _ := resp.Body.Read(buffer[tailLength:pageLength-tailLength])
+		if read == 0 {
 			break
 		}
-		line := string(lineByte[:len(lineByte)-1])
-		count++
+		endIndex := read + tailLength
 
-		traceId := ""
-		for i := range line {
-			if i >= 11 {
-				if line[i] == split {
-					traceId = line[:i]
-					traceDataBucket[pos][traceId] = append(traceDataBucket[pos][traceId], line)
-					break
+		startIndex := 0
+		for {
+			lineIndex := bytes.IndexByte(buffer[startIndex:endIndex], '\n')
+			if lineIndex < 0 {
+				tailLength = endIndex - startIndex
+				copy(buffer[:tailLength], buffer[startIndex:endIndex])
+				break
+			}
+
+			count++
+			lineByte := buffer[startIndex : startIndex+lineIndex]
+			traceId := ""
+			for i := range lineByte {
+				if i >= 11 {
+					if lineByte[i] == split {
+						traceId = string(lineByte[:i])
+						traceDataBucket[pos][traceId] = append(traceDataBucket[pos][traceId], string(lineByte))
+						break
+					}
 				}
 			}
-		}
 
-		if isError(lineByte) {
-			errorBucket[pos] = append(errorBucket[pos], traceId)
-		}
-
-		if count%batchSize == 0 {
-			errorList := errorBucket[pos]
-			go uploadErrorTraceId((count/batchSize)-1, errorList)
-
-			pos++
-
-			if pos >= bucketSize {
-				pos = 0
+			if isError(lineByte) {
+				errorBucket[pos] = append(errorBucket[pos], traceId)
 			}
 
-			if len(traceDataBucket[pos]) > 0 {
-				log.Println("Read line block")
-				cond := lockBucket[pos]
-				cond.L.Lock()
+			if count%batchSize == 0 {
+				errorList := errorBucket[pos]
+				go uploadErrorTraceId((count/batchSize)-1, errorList)
+
+				pos++
+
+				if pos >= bucketSize {
+					pos = 0
+				}
+
 				if len(traceDataBucket[pos]) > 0 {
-					cond.Wait()
+					log.Println("Read line block")
+					cond := lockBucket[pos]
+					cond.L.Lock()
+					if len(traceDataBucket[pos]) > 0 {
+						cond.Wait()
+					}
 				}
+			}
+
+			startIndex += lineIndex + 1
+			if startIndex > endIndex {
+				tailLength = 0
+				break
 			}
 		}
 	}
