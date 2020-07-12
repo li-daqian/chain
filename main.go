@@ -1,7 +1,6 @@
 package main
 
 import (
-	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -22,7 +21,6 @@ var (
 )
 
 func main() {
-	log.Printf("Start on %s", port)
 	if port == client1 || port == client2 {
 		clientInit()
 	}
@@ -39,9 +37,6 @@ func main() {
 		}
 	})
 
-	err := http.ListenAndServe(":"+port, nil)
-	if err != nil {
-		fmt.Println(err)
-		return
-	}
+	log.Printf("Start on %s", port)
+	_ = http.ListenAndServe(":"+port, nil)
 }

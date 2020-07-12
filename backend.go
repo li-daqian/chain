@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"chain/serializer"
 	"crypto/md5"
 	"encoding/hex"
 	"encoding/json"
@@ -28,9 +29,20 @@ var (
 	traceIdBatchList   []*TraceIdBatch
 	traceCheckSumData  map[string]string
 
-	canCollect = false
-	collectPos = 0
+	ports                  = [2]string{client1, client2}
+	collectChannel         = make(chan *collect)
+	collectBatchPos  int32 = 0
+	finishedBatchPos int32 = 10000
 )
+
+type collect struct {
+	batchPos    int
+	errorIdList []string
+}
+
+type finishData struct {
+	batchPos int
+}
 
 func backendInit() {
 	traceIdBatchList = make([]*TraceIdBatch, 0, bucketSize)
@@ -40,7 +52,8 @@ func backendInit() {
 		traceIdBatch := &TraceIdBatch{
 			batchPos:     -1,
 			processCount: 0,
-			errorIdList:  make([]string, 0, 512),
+			errorIdList:  make([]string, 0, 1024),
+			mux: sync.Mutex{},
 		}
 		traceIdBatchList = append(traceIdBatchList, traceIdBatch)
 	}
@@ -54,76 +67,29 @@ func backendInit() {
 	})
 
 	http.HandleFunc("/finish", func(writer http.ResponseWriter, request *http.Request) {
-		log.Println("Receive finish")
+		body, _ := ioutil.ReadAll(request.Body)
+		var data finishData
+		_ = json.Unmarshal(body, &data)
+		log.Printf("Receive finish %d", data)
+		finishedBatchPos = int32(data.batchPos)
 		atomic.AddInt32(&finishProcessCount, 1)
-	})
 
-	go backEndProcess()
-}
-
-func backEndProcess() {
-	ports := []string{client1, client2}
-	var traceIdBatch *TraceIdBatch
-	for {
-		if !canCollect {
-			continue
-		}
-		traceIdBatch = getFinishedBatch()
-		if traceIdBatch == nil {
-			if isFinish() {
-				if sendCheckSum() {
+		if finishProcessCount >= processCount {
+			for {
+				if isFinish() {
+					sendCheckSum()
 					break
 				}
 			}
-			continue
 		}
+	})
 
-		errorIdList := removeDuplicateValues(traceIdBatch.errorIdList)
-		data := make(map[string]map[string]bool)
-
-		var wg sync.WaitGroup
-		var mux sync.Mutex
-		wg.Add(processCount)
-
-		for i := range ports {
-			port := ports[i]
-			go func() {
-				processData := getWrongTrace(errorIdList, port, traceIdBatch.batchPos)
-				mux.Lock()
-				for key, value := range processData {
-					if _, ok := data[key]; !ok {
-						data[key] = make(map[string]bool)
-					}
-					for i := range value {
-						v := value[i]
-						if _, ok := data[key][v]; !ok {
-							data[key][v] = true
-						}
-					}
-				}
-				mux.Unlock()
-				wg.Done()
-			}()
+	go func() {
+		for {
+			collect := <-collectChannel
+			collectWrongTrace(collect.errorIdList, collect.batchPos)
 		}
-		wg.Wait()
-
-		spanDataList := make([]string, 0, 256)
-		for traceId, spanData := range data {
-			for k, _ := range spanData {
-				spanDataList = append(spanDataList, k)
-			}
-			sort.SliceStable(spanDataList, func(i, j int) bool {
-				return getStartTime(spanDataList[i]) < getStartTime(spanDataList[j])
-			})
-			spans := strings.Join(spanDataList, "\n") + "\n"
-			spansBytes := md5.Sum([]byte(spans))
-			traceCheckSumData[traceId] = strings.ToUpper(hex.EncodeToString(spansBytes[:]))
-
-			spanDataList = make([]string, 0, 256)
-		}
-
-		collectPos++
-	}
+	}()
 }
 
 func getStartTime(spanData string) int64 {
@@ -144,28 +110,6 @@ func getStartTime(spanData string) int64 {
 	return -1
 }
 
-func getFinishedBatch() *TraceIdBatch {
-	current := collectPos % bucketSize
-	next := current + 1
-	if next >= bucketSize {
-		next = 0
-	}
-	currentBucket := traceIdBatchList[current]
-	nextBucket := traceIdBatchList[next]
-	if finishProcessCount >= processCount && currentBucket.batchPos >= 0 ||
-		nextBucket.processCount >= processCount && currentBucket.processCount >= processCount {
-		// reset
-		traceIdBatchList[current] = &TraceIdBatch{
-			batchPos:     -1,
-			processCount: 0,
-			errorIdList:  make([]string, 0, 512),
-		}
-		return currentBucket
-	}
-
-	return nil
-}
-
 func isFinish() bool {
 	if finishProcessCount < processCount {
 		return false
@@ -181,27 +125,83 @@ func isFinish() bool {
 }
 
 func setWrongTraceId(data UploadData) {
-	if data.BatchPos < 0 {
+	batchPos := data.BatchPos
+	if batchPos < 0 {
 		return
 	}
 
-	//log.Printf("SetWrongTraceId: %v", data)
-
-	batchPos := data.BatchPos % bucketSize
-
-	traceIdBatch := traceIdBatchList[batchPos]
-	traceIdBatch.batchPos = data.BatchPos
-	atomic.AddInt32(&traceIdBatch.processCount, 1)
-
-	list := &traceIdBatch.errorIdList
+	traceIdBatch := traceIdBatchList[batchPos%bucketSize]
+	traceIdBatch.batchPos = batchPos
 
 	traceIdBatch.mux.Lock()
-	*list = append(*list, data.Errors...)
-	traceIdBatch.mux.Unlock()
-
-	if batchPos == 1 && traceIdBatch.processCount >= 2 {
-		canCollect = true
+	traceIdBatch.processCount++
+	traceIdBatch.errorIdList = append(traceIdBatch.errorIdList, data.Errors...)
+	//log.Printf("SetWrongTraceId: %d %d", batchPos, traceIdBatch.processCount)
+	if batchPos >= 1 && traceIdBatch.processCount >= processCount {
+		if finishProcessCount < processCount {
+			batchPos -= 1
+		}
+		collectData := traceIdBatchList[batchPos%bucketSize]
+		errorTraceIds := make([]string, 0, len(collectData.errorIdList))
+		copy(errorTraceIds, collectData.errorIdList)
+		collectChannel <- &collect{batchPos: batchPos, errorIdList: errorTraceIds}
+		// reset
+		traceIdBatchList[batchPos%bucketSize] = &TraceIdBatch{
+			batchPos:     -1,
+			processCount: 0,
+			errorIdList:  make([]string, 0, 1024),
+			mux: sync.Mutex{},
+		}
 	}
+	traceIdBatch.mux.Unlock()
+}
+
+func collectWrongTrace(errorTraceIds []string, batchPos int) {
+	//log.Printf("CollectWrongTrace %d", batchPos)
+	data := make(map[string]map[string]bool)
+
+	var wg sync.WaitGroup
+	var mux sync.Mutex
+	wg.Add(processCount)
+
+	for i := range ports {
+		port := ports[i]
+		go func() {
+			processData := getWrongTrace(errorTraceIds, port, batchPos)
+			mux.Lock()
+			for key, value := range processData {
+				if _, ok := data[key]; !ok {
+					data[key] = make(map[string]bool)
+				}
+				for i := range value {
+					v := value[i]
+					if _, ok := data[key][v]; !ok {
+						data[key][v] = true
+					}
+				}
+			}
+			mux.Unlock()
+			wg.Done()
+		}()
+	}
+	wg.Wait()
+
+	spanDataList := make([]string, 0, 256)
+	for traceId, spanData := range data {
+		for k, _ := range spanData {
+			spanDataList = append(spanDataList, k)
+		}
+		sort.SliceStable(spanDataList, func(i, j int) bool {
+			return getStartTime(spanDataList[i]) < getStartTime(spanDataList[j])
+		})
+		spans := strings.Join(spanDataList, "\n") + "\n"
+		spansBytes := md5.Sum([]byte(spans))
+		traceCheckSumData[traceId] = strings.ToUpper(hex.EncodeToString(spansBytes[:]))
+
+		spanDataList = make([]string, 0, 256)
+	}
+
+	collectBatchPos++
 }
 
 type getWrongTraceStruct struct {
@@ -213,10 +213,9 @@ func getWrongTrace(traceIdList []string, port string, batchPos int) map[string][
 	data, _ := json.Marshal(getWrongTraceStruct{traceIdList, batchPos})
 	response, _ := http.Post("http://localhost:"+port+"/getWrongTrace", "application/json", bytes.NewBuffer(data))
 
-	var result map[string][]string
 	body, _ := ioutil.ReadAll(response.Body)
-	_ = json.Unmarshal(body, &result)
-	return result
+	res := serializer.GetWrongTrace(body)
+	return res
 }
 
 func sendCheckSum() bool {

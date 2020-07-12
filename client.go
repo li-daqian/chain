@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"chain/serializer"
 	"encoding/json"
 	"io/ioutil"
 	"log"
@@ -9,32 +10,28 @@ import (
 	"sync"
 )
 
+const (
+	bucketSize      = 128
+	pageLength      = 1024 * 1024 * 16
+	split      byte = '|'
+)
+
 var (
-	bucketSize      = 64
-	traceDataBucket = make([]map[string][]string, bucketSize)
-	errorBucket     = make([][]string, bucketSize)
-	lock            = sync.Mutex{}
-	lockBucket      = make([]*sync.Cond, bucketSize)
+	pageBucket = [bucketSize]*Page{}
+	lock       = sync.Mutex{}
+	lockBucket = [bucketSize]*sync.Cond{}
 
-	split    byte = '|'
-	tagSplit byte = '&'
-
-	error1       = "error=1"
-	error1Length = len(error1)
-
-	error2                 = "http.status_code="
-	error2Length           = len(error2)
-	httpStatusCodeOk       = "http.status_code=200"
-	httpStatusCodeOKLength = len(httpStatusCodeOk)
-
-	pageLength = 1024*1024*4
-	buffer = make([]byte, pageLength)
+	//readCost = int64(0)
+	//findLineCost = int64(0)
+	//findTraceIdCost = int64(0)
+	//findErrorCost = int64(0)
 )
 
 func clientInit() {
 	for i := 0; i < bucketSize; i++ {
-		traceDataBucket[i] = make(map[string][]string, 4096)
-		errorBucket[i] = make([]string, 0, 512)
+		page := &Page{buffer: make([]byte, pageLength)}
+		page.Reset()
+		pageBucket[i] = page
 		lockBucket[i] = sync.NewCond(&lock)
 	}
 
@@ -45,8 +42,7 @@ func clientInit() {
 		_ = json.Unmarshal(body, &data)
 
 		response := getWrongTracing(&data)
-		responseBytes, _ := json.Marshal(response)
-		_, _ = writer.Write(responseBytes)
+		_, _ = writer.Write(response)
 	})
 }
 
@@ -60,74 +56,83 @@ func clientProcess() {
 
 	count := 0
 	pos := 0
-	tailLength := 0
+	lineStartIndex := 0
+ReadLoop:
+	page := pageBucket[pos]
 	for {
-		read, _ := resp.Body.Read(buffer[tailLength:pageLength-tailLength])
-		if read == 0 {
-			break
+		//startTime := time.Now()
+		read := page.Read(resp.Body)
+		//readCost += time.Since(startTime).Nanoseconds()
+		if read < 0 {
+			goto Finish
 		}
-		endIndex := read + tailLength
-
-		startIndex := 0
+		buffer := page.buffer
+		endIndex := read
 		for {
-			lineIndex := bytes.IndexByte(buffer[startIndex:endIndex], '\n')
-			if lineIndex < 0 {
-				tailLength = endIndex - startIndex
-				copy(buffer[:tailLength], buffer[startIndex:endIndex])
-				break
+			//startTime = time.Now()
+			lineEndIndex := bytes.IndexByte(buffer[lineStartIndex:endIndex], '\n')
+			//findLineCost += time.Since(startTime).Nanoseconds()
+			if lineEndIndex < 0 {
+				goto ReadLoop
 			}
-
 			count++
-			lineByte := buffer[startIndex : startIndex+lineIndex]
-			traceId := ""
-			for i := range lineByte {
-				if i >= 11 {
-					if lineByte[i] == split {
-						traceId = string(lineByte[:i])
-						traceDataBucket[pos][traceId] = append(traceDataBucket[pos][traceId], string(lineByte))
-						break
-					}
+			lineEndIndex += lineStartIndex
+
+			//startTime = time.Now()
+			var traceId []byte
+			for i := lineStartIndex + 11; i < lineStartIndex+lineEndIndex; i++ {
+				if buffer[i] == split {
+					traceId = buffer[lineStartIndex:i]
+					page.putSpans(traceId, lineStartIndex, lineEndIndex)
+					break
 				}
 			}
+			//findTraceIdCost += time.Since(startTime).Nanoseconds()
 
-			if isError(lineByte) {
-				errorBucket[pos] = append(errorBucket[pos], traceId)
+			//startTime = time.Now()
+			if isError(buffer[lineStartIndex:lineEndIndex]) {
+				page.putErrors(traceId)
 			}
+			//findErrorCost = time.Since(startTime).Nanoseconds()
 
 			if count%batchSize == 0 {
-				errorList := errorBucket[pos]
-				go uploadErrorTraceId((count/batchSize)-1, errorList)
+				//log.Printf("readCost: %d ms", readCost / 1000 / 1000)
+				//log.Printf("findLineCost: %d ms", findLineCost / 1000 / 1000)
+				//log.Printf("FindTraceIdCost: %d ms", findTraceIdCost / 1000 / 1000)
+				//log.Printf("findErrorCost: %d ms", findErrorCost / 1000 / 1000)
+				go uploadErrorTraceId((count/batchSize)-1, page.errors)
 
 				pos++
-
 				if pos >= bucketSize {
 					pos = 0
 				}
 
-				if len(traceDataBucket[pos]) > 0 {
-					log.Println("Read line block")
+				if !pageBucket[pos].isEmpty {
+					log.Printf("Read line block batchPos:%d", (count/batchSize)-1)
 					cond := lockBucket[pos]
 					cond.L.Lock()
-					if len(traceDataBucket[pos]) > 0 {
+					if !pageBucket[pos].isEmpty {
 						cond.Wait()
 					}
 				}
+
+				page.CopyNext(pageBucket[pos], lineStartIndex, endIndex)
+				lineStartIndex = 0
+				goto ReadLoop
 			}
 
-			startIndex += lineIndex + 1
-			if startIndex > endIndex {
-				tailLength = 0
-				break
-			}
+			lineStartIndex = lineEndIndex + 1
 		}
 	}
 
-	errorList := errorBucket[pos]
+Finish:
+	errorList := page.errors
+	batchPos := (count/batchSize)-1
 	if len(errorList) > 0 {
-		uploadErrorTraceId((count/batchSize)-1, errorList)
+		uploadErrorTraceId(batchPos, errorList)
 	}
 
-	callFinish()
+	callFinish(batchPos)
 }
 
 func getUrl() string {
@@ -163,7 +168,7 @@ func isError(line []byte) bool {
 	}
 }
 
-func getWrongTracing(data *getWrongTraceStruct) map[string][]string {
+func getWrongTracing(data *getWrongTraceStruct) []byte {
 	wrongTraceIdList := data.TraceIdList
 	pos := data.BatchPos % bucketSize
 	prePos := pos - 1
@@ -175,31 +180,30 @@ func getWrongTracing(data *getWrongTraceStruct) map[string][]string {
 		nextPos = 0
 	}
 
-	wrongTraceData := make(map[string][]string)
+	res := make([]byte, 0, 2048)
 	if len(wrongTraceIdList) > 0 {
-		getWrongTraceWithPos(prePos, wrongTraceIdList, wrongTraceData)
-		getWrongTraceWithPos(pos, wrongTraceIdList, wrongTraceData)
-		getWrongTraceWithPos(nextPos, wrongTraceIdList, wrongTraceData)
+		serializer.PutType(&res, serializer.WrongTrace)
+		for i := range wrongTraceIdList {
+			traceId := wrongTraceIdList[i]
+			getWrongTraceWithPos(prePos, traceId, &res)
+			getWrongTraceWithPos(pos, traceId, &res)
+			getWrongTraceWithPos(nextPos, traceId, &res)
+		}
 	}
 
 	cond := lockBucket[prePos]
 	cond.L.Lock()
-	traceDataBucket[prePos] = make(map[string][]string, batchSize)
-	errorBucket[prePos] = make([]string, 0, 512)
+	pageBucket[prePos].Reset()
 	cond.Broadcast()
 	cond.L.Unlock()
 
-	return wrongTraceData
+	return res
 }
 
-func getWrongTraceWithPos(pos int, wrongTraceIdList []string, wrongTraceData map[string][]string) {
-	traceData := traceDataBucket[pos]
-	for i := range wrongTraceIdList {
-		traceId := wrongTraceIdList[i]
-		spanList := traceData[traceId]
-		if spanList != nil {
-			wrongTraceData[traceId] = append(wrongTraceData[traceId], spanList...)
-		}
+func getWrongTraceWithPos(pos int, traceId string, buffer *[]byte) {
+	spanList := pageBucket[pos].getSpans([]byte(traceId))
+	if spanList != nil {
+		serializer.Put(buffer, []byte(traceId), spanList)
 	}
 }
 
@@ -208,12 +212,19 @@ type UploadData struct {
 	Errors   []string
 }
 
-func uploadErrorTraceId(batchPos int, errorData []string) {
-	uploadData := UploadData{batchPos, errorData}
-	data, _ := json.Marshal(uploadData)
-	_, _ = http.Post("http://localhost:"+backend+"/setWrongTraceId", "application/json", bytes.NewBuffer(data))
+func uploadErrorTraceId(batchPos int, errorData [][]byte) {
+	data := make([]string, 0, len(errorData))
+	for i := range errorData {
+		data = append(data, string(errorData[i]))
+	}
+	uploadData := UploadData{batchPos, data}
+	jsonData, _ := json.Marshal(uploadData)
+	_, _ = http.Post("http://localhost:"+backend+"/setWrongTraceId", "application/json", bytes.NewBuffer(jsonData))
 }
 
-func callFinish() {
-	_, _ = http.Get("http://localhost:" + backend + "/finish")
+func callFinish(batchPos int) {
+	log.Println("Call finish")
+	data := finishData{batchPos}
+	jsonData, _ := json.Marshal(data)
+	_, _ = http.Post("http://localhost:" + backend + "/finish", "application/json", bytes.NewBuffer(jsonData))
 }
