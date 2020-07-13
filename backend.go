@@ -29,10 +29,9 @@ var (
 	traceIdBatchList   []*TraceIdBatch
 	traceCheckSumData  map[string]string
 
-	ports                  = [2]string{client1, client2}
-	collectChannel         = make(chan *collect)
-	collectBatchPos  int32 = 0
-	finishedBatchPos int32 = 10000
+	ports                 = [2]string{client1, client2}
+	collectChannel        = make(chan *collect)
+	collectBatchPos int32 = 0
 )
 
 type collect struct {
@@ -53,7 +52,7 @@ func backendInit() {
 			batchPos:     -1,
 			processCount: 0,
 			errorIdList:  make([]string, 0, 1024),
-			mux: sync.Mutex{},
+			mux:          sync.Mutex{},
 		}
 		traceIdBatchList = append(traceIdBatchList, traceIdBatch)
 	}
@@ -70,11 +69,15 @@ func backendInit() {
 		body, _ := ioutil.ReadAll(request.Body)
 		var data finishData
 		_ = json.Unmarshal(body, &data)
-		log.Printf("Receive finish %d", data)
-		finishedBatchPos = int32(data.batchPos)
+		log.Printf("Receive finish %d", data.batchPos)
 		atomic.AddInt32(&finishProcessCount, 1)
 
 		if finishProcessCount >= processCount {
+			for i := range traceIdBatchList {
+				if traceIdBatchList[i].batchPos != -1 {
+					invokeCollect(traceIdBatchList[i].batchPos)
+				}
+			}
 			for {
 				if isFinish() {
 					sendCheckSum()
@@ -111,12 +114,9 @@ func getStartTime(spanData string) int64 {
 }
 
 func isFinish() bool {
-	if finishProcessCount < processCount {
-		return false
-	}
-
 	for i := range traceIdBatchList {
 		if traceIdBatchList[i].batchPos != -1 {
+			log.Printf("traceIdBatch not finish. %v", traceIdBatchList[i])
 			return false
 		}
 	}
@@ -136,28 +136,28 @@ func setWrongTraceId(data UploadData) {
 	traceIdBatch.mux.Lock()
 	traceIdBatch.processCount++
 	traceIdBatch.errorIdList = append(traceIdBatch.errorIdList, data.Errors...)
-	//log.Printf("SetWrongTraceId: %d %d", batchPos, traceIdBatch.processCount)
 	if batchPos >= 1 && traceIdBatch.processCount >= processCount {
-		if finishProcessCount < processCount {
-			batchPos -= 1
-		}
-		collectData := traceIdBatchList[batchPos%bucketSize]
-		errorTraceIds := make([]string, 0, len(collectData.errorIdList))
-		copy(errorTraceIds, collectData.errorIdList)
-		collectChannel <- &collect{batchPos: batchPos, errorIdList: errorTraceIds}
-		// reset
-		traceIdBatchList[batchPos%bucketSize] = &TraceIdBatch{
-			batchPos:     -1,
-			processCount: 0,
-			errorIdList:  make([]string, 0, 1024),
-			mux: sync.Mutex{},
-		}
+		batchPos -= 1
+		invokeCollect(batchPos)
 	}
 	traceIdBatch.mux.Unlock()
 }
 
+func invokeCollect(batchPos int) {
+	collectData := traceIdBatchList[batchPos%bucketSize]
+	errorTraceIds := make([]string, len(collectData.errorIdList))
+	copy(errorTraceIds, collectData.errorIdList)
+	collectChannel <- &collect{batchPos: batchPos, errorIdList: errorTraceIds}
+	// reset
+	traceIdBatchList[batchPos%bucketSize] = &TraceIdBatch{
+		batchPos:     -1,
+		processCount: 0,
+		errorIdList:  make([]string, 0, 1024),
+		mux:          sync.Mutex{},
+	}
+}
+
 func collectWrongTrace(errorTraceIds []string, batchPos int) {
-	//log.Printf("CollectWrongTrace %d", batchPos)
 	data := make(map[string]map[string]bool)
 
 	var wg sync.WaitGroup
