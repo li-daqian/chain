@@ -22,7 +22,6 @@ var (
 )
 
 func main() {
-	log.Printf("Start on %s", port)
 	if port == client1 || port == client2 {
 		clientInit()
 	}
@@ -38,6 +37,7 @@ func main() {
 			go clientProcess()
 		}
 	})
+	log.Printf("Start on %s", port)
 
 	err := http.ListenAndServe(":"+port, nil)
 	if err != nil {

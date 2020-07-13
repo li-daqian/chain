@@ -9,31 +9,24 @@ import (
 	"sync"
 )
 
-var (
+const (
 	bucketSize      = 64
+	pageLength = 1024 * 1024 * 4
+
+	split    byte = '|'
+)
+var (
 	traceDataBucket = make([]map[string][]string, bucketSize)
 	errorBucket     = make([][]string, bucketSize)
 	lock            = sync.Mutex{}
 	lockBucket      = make([]*sync.Cond, bucketSize)
 
-	split    byte = '|'
-	tagSplit byte = '&'
-
-	error1       = "error=1"
-	error1Length = len(error1)
-
-	error2                 = "http.status_code="
-	error2Length           = len(error2)
-	httpStatusCodeOk       = "http.status_code=200"
-	httpStatusCodeOKLength = len(httpStatusCodeOk)
-
-	pageLength = 1024*1024*4
-	buffer = make([]byte, pageLength)
+	buffer     = make([]byte, pageLength)
 )
 
 func clientInit() {
 	for i := 0; i < bucketSize; i++ {
-		traceDataBucket[i] = make(map[string][]string, 4096)
+		traceDataBucket[i] = make(map[string][]string, batchSize)
 		errorBucket[i] = make([]string, 0, 512)
 		lockBucket[i] = sync.NewCond(&lock)
 	}
@@ -62,7 +55,7 @@ func clientProcess() {
 	pos := 0
 	tailLength := 0
 	for {
-		read, _ := resp.Body.Read(buffer[tailLength:pageLength-tailLength])
+		read, _ := resp.Body.Read(buffer[tailLength : pageLength-tailLength])
 		if read == 0 {
 			break
 		}
@@ -78,19 +71,18 @@ func clientProcess() {
 			}
 
 			count++
-			lineByte := buffer[startIndex : startIndex+lineIndex]
+			lineEndIndex := startIndex + lineIndex
 			traceId := ""
-			for i := range lineByte {
-				if i >= 11 {
-					if lineByte[i] == split {
-						traceId = string(lineByte[:i])
-						traceDataBucket[pos][traceId] = append(traceDataBucket[pos][traceId], string(lineByte))
-						break
-					}
+			for i:= startIndex + 11; i < lineEndIndex; i++ {
+				if buffer[i] == split {
+					traceId = string(buffer[startIndex:i])
+					//traceIdHash := hash(buffer, startIndex)
+					traceDataBucket[pos][traceId] = append(traceDataBucket[pos][traceId], string(buffer[startIndex:lineEndIndex]))
+					break
 				}
 			}
 
-			if isError(lineByte) {
+			if isError(buffer, startIndex, lineEndIndex) {
 				errorBucket[pos] = append(errorBucket[pos], traceId)
 			}
 
@@ -140,19 +132,19 @@ func getUrl() string {
 	return ""
 }
 
-func isError(line []byte) bool {
-	searchStart := 100
-	searchEnd := len(line) - 1
+func isError(buffer []byte, start int, end int) bool {
+	searchStart := start + 100
+	searchEnd := end
 	for {
-		pos := bytes.IndexByte(line[searchStart:searchEnd], '=')
+		pos := bytes.IndexByte(buffer[searchStart:searchEnd], '=')
 		if pos < 0 {
 			return false
 		}
 		searchStart += pos
-		if line[searchStart-2] == 'd' && line[searchStart-1] == 'e' {
-			return line[searchStart+1] != '2'
+		if buffer[searchStart-2] == 'd' && buffer[searchStart-1] == 'e' {
+			return buffer[searchStart+1] != '2'
 		}
-		if line[searchStart-2] == 'o' && line[searchStart-1] == 'r' {
+		if buffer[searchStart-2] == 'o' && buffer[searchStart-1] == 'r' {
 			return true
 		}
 
@@ -177,9 +169,13 @@ func getWrongTracing(data *getWrongTraceStruct) map[string][]string {
 
 	wrongTraceData := make(map[string][]string)
 	if len(wrongTraceIdList) > 0 {
-		getWrongTraceWithPos(prePos, wrongTraceIdList, wrongTraceData)
-		getWrongTraceWithPos(pos, wrongTraceIdList, wrongTraceData)
-		getWrongTraceWithPos(nextPos, wrongTraceIdList, wrongTraceData)
+		for i := range wrongTraceIdList {
+			traceId := wrongTraceIdList[i]
+			//traceIdHash := hash([]byte(traceId), 0)
+			wrongTraceData[traceId] = append(wrongTraceData[traceId], traceDataBucket[prePos][traceId]...)
+			wrongTraceData[traceId] = append(wrongTraceData[traceId], traceDataBucket[pos][traceId]...)
+			wrongTraceData[traceId] = append(wrongTraceData[traceId], traceDataBucket[nextPos][traceId]...)
+		}
 	}
 
 	cond := lockBucket[prePos]
@@ -190,17 +186,6 @@ func getWrongTracing(data *getWrongTraceStruct) map[string][]string {
 	cond.L.Unlock()
 
 	return wrongTraceData
-}
-
-func getWrongTraceWithPos(pos int, wrongTraceIdList []string, wrongTraceData map[string][]string) {
-	traceData := traceDataBucket[pos]
-	for i := range wrongTraceIdList {
-		traceId := wrongTraceIdList[i]
-		spanList := traceData[traceId]
-		if spanList != nil {
-			wrongTraceData[traceId] = append(wrongTraceData[traceId], spanList...)
-		}
-	}
 }
 
 type UploadData struct {
@@ -216,4 +201,11 @@ func uploadErrorTraceId(batchPos int, errorData []string) {
 
 func callFinish() {
 	_, _ = http.Get("http://localhost:" + backend + "/finish")
+}
+
+func hash(traceId []byte, start int) int32 {
+	return (int32(traceId[start]) +
+			int32(traceId[start+1])<<8 +
+			int32(traceId[start+2])<<16 +
+			int32(traceId[start+3])<<24) % batchSize
 }
